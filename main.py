@@ -4,6 +4,7 @@ from PIL import Image
 import io
 import os
 import logging
+import gc
 from pathlib import Path
 
 import torch
@@ -14,6 +15,10 @@ from torch import nn
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "best_model.pth"
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_SIDE = 1024
+INFER_IMAGE_SIZE = 224
+TORCH_NUM_THREADS = 1
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("smartfarm-ai")
@@ -29,6 +34,10 @@ app.add_middleware(
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_num_threads(TORCH_NUM_THREADS)
+torch.set_num_interop_threads(1)
+if hasattr(torch, "backends") and hasattr(torch.backends, "mkldnn"):
+    torch.backends.mkldnn.enabled = False
 
 
 def build_resnet18(num_classes: int) -> nn.Module:
@@ -114,7 +123,7 @@ model, classes = load_model_and_classes(MODEL_PATH, device)
 use_imagenet_norm = os.getenv("USE_IMAGENET_NORMALIZE", "1") == "1"
 
 transform_steps = [
-    transforms.Resize((224, 224)),
+    transforms.Resize((INFER_IMAGE_SIZE, INFER_IMAGE_SIZE)),
     transforms.ToTensor(),
 ]
 if use_imagenet_norm:
@@ -123,7 +132,12 @@ if use_imagenet_norm:
     )
 
 transform = transforms.Compose(transform_steps)
-logger.info("Transform configured | resize=224x224 to_tensor=True imagenet_normalize=%s", use_imagenet_norm)
+logger.info(
+    "Transform configured | resize=%sx%s to_tensor=True imagenet_normalize=%s",
+    INFER_IMAGE_SIZE,
+    INFER_IMAGE_SIZE,
+    use_imagenet_norm,
+)
 
 MESSAGES = {
     "healthy": "현재 이미지에서는 뚜렷한 질병 징후가 보이지 않습니다.",
@@ -146,38 +160,59 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드할 수 있습니다.")
 
     image_bytes = await file.read()
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="이미지 파일 크기가 너무 큽니다.")
 
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="이미지를 읽을 수 없습니다.")
 
-    input_tensor = transform(image).unsqueeze(0).to(device)
+    # 초고해상도 원본으로 인한 메모리 피크 완화를 위해 긴 변 기준으로 1차 축소
+    if max(image.size) > MAX_IMAGE_SIDE:
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
 
-    with torch.no_grad():
-        logits = model(input_tensor)
-        probs = F.softmax(logits, dim=1)
-        confidence, pred_idx = torch.max(probs, dim=1)
+    input_tensor = None
+    logits = None
+    probs = None
+    confidence = None
+    pred_idx = None
+    try:
+        input_tensor = transform(image).unsqueeze(0).to(device)
 
-    pred_idx_int = int(pred_idx.item())
-    if pred_idx_int < 0 or pred_idx_int >= len(classes):
-        raise HTTPException(status_code=500, detail="예측 인덱스가 클래스 범위를 벗어났습니다.")
+        with torch.no_grad():
+            logits = model(input_tensor)
+            probs = F.softmax(logits, dim=1)
+            confidence, pred_idx = torch.max(probs, dim=1)
 
-    label = classes[pred_idx_int]
-    conf = float(confidence.item())
+        pred_idx_int = int(pred_idx.item())
+        if pred_idx_int < 0 or pred_idx_int >= len(classes):
+            raise HTTPException(status_code=500, detail="예측 인덱스가 클래스 범위를 벗어났습니다.")
 
-    # 디버깅 로그
-    logger.info("Predict debug | logits=%s", logits.detach().cpu().numpy().round(6).tolist())
-    logger.info("Predict debug | probs=%s", probs.detach().cpu().numpy().round(6).tolist())
-    logger.info("Predict debug | pred_idx=%d class_name=%s confidence=%.6f", pred_idx_int, label, conf)
+        label = classes[pred_idx_int]
+        conf = float(confidence.item())
 
-    return {
-        "result": label,
-        "label": label,
-        "class_index": pred_idx_int,
-        "confidence": round(conf, 4),
-        "probabilities": {
-            classes[i]: float(probs[0, i].item()) for i in range(len(classes))
-        },
-        "message": MESSAGES.get(label, f"{label}로 분류되었습니다."),
-    }
+        # 디버깅 로그
+        logger.info("Predict debug | logits=%s", logits.detach().cpu().numpy().round(6).tolist())
+        logger.info("Predict debug | probs=%s", probs.detach().cpu().numpy().round(6).tolist())
+        logger.info("Predict debug | pred_idx=%d class_name=%s confidence=%.6f", pred_idx_int, label, conf)
+
+        return {
+            "result": label,
+            "label": label,
+            "class_index": pred_idx_int,
+            "confidence": round(conf, 4),
+            "probabilities": {
+                classes[i]: float(probs[0, i].item()) for i in range(len(classes))
+            },
+            "message": MESSAGES.get(label, f"{label}로 분류되었습니다."),
+        }
+    finally:
+        del image_bytes
+        del image
+        del input_tensor
+        del logits
+        del probs
+        del confidence
+        del pred_idx
+        gc.collect()
